@@ -184,9 +184,9 @@ def _compute_mx_quant_and_scale_rne(
     """
     Compute MX quantization with RNE (Round to Nearest Even) rounding for the scale.
     
-    RNE is applied when converting max_abs to E8M0 format (nearest power of 2).
-    This is equivalent to computing: scale = 2^(clip(floor(log2(RNE(max_abs(x)))), -127, 127) - 2)
-    where RNE rounds to the nearest power of 2, with ties going to even exponent.
+    RNE is applied to max_abs to round to nearest even integer first.
+    Then: scale = 2^(clip(floor(log2(RNE(max_abs(x)))), -127, 127) - 2)
+    where RNE rounds to the nearest even integer (Banker's rounding).
     """
     is_fp8: tl.constexpr = (
         mx_tensor_dtype == tl.float8e4nv or mx_tensor_dtype == tl.float8e5
@@ -198,38 +198,36 @@ def _compute_mx_quant_and_scale_rne(
     # Explicit cast to fp32 since most ops are not supported on bfloat16
     f32_tensor = src_tensor.to(tl.float32)
     abs_tensor = tl.abs(f32_tensor)
-    abs_tensor = tl.where(
-        valid_src_mask, abs_tensor, -1.0
-    )  # Don't consider padding tensors in scale computation
+    abs_tensor = tl.where(valid_src_mask, abs_tensor, -1.0)
     abs_tensor = tl.reshape(
         abs_tensor, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32]
     )
     max_val = tl.max(abs_tensor, axis=2, keep_dims=True)
     
-    # RNE (Round to Nearest Even) rounding when converting max_abs to E8M0 format
-    # E8M0 stores only exponent (no mantissa), so we round to nearest power of 2
-    # Extract exponent and mantissa from float32
-    max_val_bits = max_val.to(tl.uint32, bitcast=True)
-    exponent = (max_val_bits >> 23) & 0xFF
-    mantissa = max_val_bits & 0x7FFFFF
+    # Apply RNE (Round to Nearest Even) to round max_val to nearest even integer
+    # For ties (e.g., 4.5, 5.5), round to the even integer
+    floor_val = tl.floor(max_val)
+    ceil_val = tl.ceil(max_val)
+    frac = max_val - floor_val
     
-    # RNE to nearest power of 2:
-    # For value 2^n * (1 + m/2^23), the threshold is at m = 0.5 * 2^23 = 0x400000
-    # - If mantissa < 0x400000: round to 2^n (keep exponent)
-    # - If mantissa > 0x400000: round to 2^(n+1) (increment exponent)
-    # - If mantissa == 0x400000: tie case, round to even exponent (RNE)
+    # Check if it's a tie (fractional part == 0.5)
+    is_tie = tl.abs(frac - 0.5) < 1e-6
     
-    # Determine if we should round up
-    should_round_up = (mantissa > 0x400000) | (
-        (mantissa == 0x400000) & ((exponent & 1) == 1)
-    )
+    # For ties, choose even; otherwise choose nearest
+    # If floor is even, round down on tie; if floor is odd, round up on tie
+    floor_is_even = (floor_val.to(tl.int32) & 1) == 0
+    should_round_up = (frac > 0.5) | (is_tie & (~floor_is_even))
     
-    rounded_exponent = tl.where(should_round_up, exponent + 1, exponent)
+    rounded_max = tl.where(should_round_up, ceil_val, floor_val)
+    rounded_max = tl.maximum(rounded_max, 1.0)  # Avoid log2(0)
     
-    # Subtract 2 from exponent (divide by 4) to get final scale exponent
-    # Clamp to valid E8M0 range [-127, 127] (exponent 0-254 in biased representation)
-    scale_exponent = rounded_exponent - 2
-    scale_exponent = tl.maximum(scale_exponent, 0)
+    # Compute floor(log2(rounded_max))
+    log2_val = tl.log2(rounded_max)
+    exponent = tl.floor(log2_val).to(tl.int32)
+    
+    # Clip to valid E8M0 range and subtract 2
+    # E8M0 exponent range: -127 to 127 (biased: 0 to 254)
+    scale_exponent = tl.maximum(exponent - 2 + 127, 0)  # Add bias
     scale_exponent = tl.minimum(scale_exponent, 254)
     
     # Construct the scale as a power of 2
